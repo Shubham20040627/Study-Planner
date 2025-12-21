@@ -1,0 +1,179 @@
+/**
+ * Scheduler service to generate timetable slots from tasks
+ * Simple algorithm:
+ * 1. Sort tasks by due date → duration
+ * 2. Fit tasks into available study blocks
+ * 3. Generate slots in 50-min blocks with 10-min breaks
+ */
+
+/**
+ * Generate timetable slots for a given date range
+ * @param {Array} tasks - Array of task objects
+ * @param {Date} startDate - Start date for timetable
+ * @param {Date} endDate - End date for timetable
+ * @param {Object} userSettings - User settings (studyHoursPerDay, preferredTime)
+ * @returns {Array} Array of timetable slot objects
+ */
+export const generateTimetable = (tasks, startDate, endDate, userSettings) => {
+  const slots = [];
+  const { studyHoursPerDay = 6, preferredTime = '09:00' } = userSettings;
+  const studyMinutesPerDay = studyHoursPerDay * 60;
+
+  // Filter and sort tasks
+  // Keep all incomplete tasks in the pool (even if due after endDate) so
+  // subjects with later deadlines still get time scheduled.
+  const availableTasks = tasks
+    .filter((task) => !task.completed)
+    .sort((a, b) => {
+      // Sort by due date first
+      const dateDiff = new Date(a.dueDate) - new Date(b.dueDate);
+      if (dateDiff !== 0) return dateDiff;
+
+      // Then by duration (shorter first)
+      return a.durationMinutes - b.durationMinutes;
+    });
+
+  // Generate slots for each day
+  const currentDate = new Date(startDate);
+  currentDate.setHours(0, 0, 0, 0);
+
+  while (currentDate <= endDate) {
+    // Get tasks that should be scheduled on this day (based on due date)
+    const dayTasks = availableTasks.filter((task) => {
+      const taskDueDate = new Date(task.dueDate);
+      taskDueDate.setHours(0, 0, 0, 0);
+      return taskDueDate <= currentDate;
+    });
+
+    if (dayTasks.length === 0) {
+      currentDate.setDate(currentDate.getDate() + 1);
+      continue;
+    }
+
+    // Sort tasks by preferred time (earlier times first)
+    dayTasks.sort((a, b) => {
+      const timeA = a.preferredTime || preferredTime;
+      const timeB = b.preferredTime || preferredTime;
+      const [hourA, minA] = timeA.split(':').map(Number);
+      const [hourB, minB] = timeB.split(':').map(Number);
+      const timeDiff = (hourA * 60 + minA) - (hourB * 60 + minB);
+      if (timeDiff !== 0) return timeDiff;
+      // If same time, sort by due date then duration
+      const dateDiff = new Date(a.dueDate) - new Date(b.dueDate);
+      if (dateDiff !== 0) return dateDiff;
+      return a.durationMinutes - b.durationMinutes;
+    });
+
+    // Track scheduled slots for this day to detect conflicts
+    const dayScheduledSlots = [];
+
+    // Schedule each task at its preferred time
+    for (const task of dayTasks) {
+      const taskDuration = task.durationMinutes;
+      const taskTime = task.preferredTime || preferredTime;
+      const [taskPreferredHour, taskPreferredMinute] = taskTime
+        .split(':')
+        .map(Number);
+
+      // Calculate task start time
+      let taskStart = new Date(currentDate);
+      taskStart.setHours(taskPreferredHour || 0, taskPreferredMinute || 0, 0, 0);
+
+      // Check for conflicts with already scheduled tasks
+      let conflictFound = false;
+      for (const existingSlot of dayScheduledSlots) {
+        const existingStart = new Date(existingSlot.start);
+        const existingEnd = new Date(existingSlot.end);
+        const taskEnd = new Date(taskStart);
+        taskEnd.setMinutes(taskEnd.getMinutes() + taskDuration);
+
+        // Check if there's an overlap
+        if (
+          (taskStart >= existingStart && taskStart < existingEnd) ||
+          (taskEnd > existingStart && taskEnd <= existingEnd) ||
+          (taskStart <= existingStart && taskEnd >= existingEnd)
+        ) {
+          // Conflict found - adjust task start time to after the conflicting slot
+          taskStart = new Date(existingEnd);
+          conflictFound = true;
+        }
+      }
+
+      // Check if task fits within the day (before 23:59)
+      const taskEnd = new Date(taskStart);
+      taskEnd.setMinutes(taskEnd.getMinutes() + taskDuration);
+      const dayEnd = new Date(currentDate);
+      dayEnd.setHours(23, 59, 59, 999);
+
+      if (taskEnd > dayEnd) {
+        // Task doesn't fit in this day, skip it
+        continue;
+      }
+
+      // Calculate number of 50-minute blocks needed
+      const blocksNeeded = Math.ceil(taskDuration / 50);
+      let taskRemaining = taskDuration;
+      let currentBlockStart = new Date(taskStart);
+
+      // Create slots for this task
+      for (let block = 0; block < blocksNeeded && taskRemaining > 0; block++) {
+        const slotDuration = Math.min(50, taskRemaining);
+        const slotEnd = new Date(currentBlockStart);
+        slotEnd.setMinutes(slotEnd.getMinutes() + slotDuration);
+
+        const slot = {
+          start: new Date(currentBlockStart),
+          end: new Date(slotEnd),
+          task: task._id || task.id,
+          status: 'pending',
+          autoGenerated: true,
+        };
+
+        slots.push(slot);
+        dayScheduledSlots.push(slot);
+
+        taskRemaining -= slotDuration;
+        // Add 10-minute break after each block (except the last)
+        if (taskRemaining > 0) {
+          currentBlockStart = new Date(slotEnd);
+          currentBlockStart.setMinutes(currentBlockStart.getMinutes() + 10);
+        }
+      }
+
+      // Remove task from available tasks (mark as scheduled)
+      const taskIndex = availableTasks.findIndex(
+        (t) => (t._id || t.id).toString() === (task._id || task.id).toString()
+      );
+      if (taskIndex > -1) {
+        availableTasks.splice(taskIndex, 1);
+      }
+    }
+
+    // Move to next day
+    currentDate.setDate(currentDate.getDate() + 1);
+  }
+
+  return slots;
+};
+
+/**
+ * Format slots for a specific day
+ * @param {Array} slots - Array of all slots
+ * @param {Date} date - Date to filter slots for
+ * @returns {Array} Filtered slots for the day
+ */
+export const getSlotsForDay = (slots, date) => {
+  const dayStart = new Date(date);
+  dayStart.setHours(0, 0, 0, 0);
+  const dayEnd = new Date(date);
+  dayEnd.setHours(23, 59, 59, 999);
+
+  return slots.filter((slot) => {
+    const slotStart = new Date(slot.start);
+    return slotStart >= dayStart && slotStart <= dayEnd;
+  });
+};
+
+
+
+
